@@ -2,3 +2,4 @@
 *.pth
 *pycache*
 dataset_*
+data*
