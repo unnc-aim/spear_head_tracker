@@ -41,9 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--gray-threshold", type=int, default=150)
     parser.add_argument("--gaussian-sigma", type=float, default=8.0)
+    parser.add_argument("--max-fill-distance", type=float, default=24.0)
+    parser.add_argument("--center-prior-sigma", type=float, default=0.45)
     parser.add_argument("--pos-weight", type=float, default=5.0)
     parser.add_argument("--test-split", choices=("train", "val", "test"), default="test")
-    parser.add_argument("--test-threshold", type=float, default=0.5)
+    parser.add_argument("--test-threshold", type=float, default=0.8)
+    parser.add_argument("--test-label-threshold", type=float, default=None)
     parser.add_argument("--test-output", type=Path, default=None)
     parser.add_argument("--test-seed", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -58,6 +61,8 @@ def make_loader(args: argparse.Namespace, split: str, shuffle: bool) -> DataLoad
         cache_dir=args.cache_dir,
         gray_threshold=args.gray_threshold,
         gaussian_sigma=args.gaussian_sigma,
+        max_fill_distance=args.max_fill_distance,
+        center_prior_sigma=args.center_prior_sigma,
     )
     return DataLoader(
         dataset,
@@ -165,10 +170,13 @@ def test(
     output_path: str | Path = "runs/heatmap_train/test_heatmap_prediction.jpg",
     split: str = "test",
     threshold: float = 0.5,
+    label_threshold: float | None = None,
     img_size: tuple[int, int] = (640, 640),
     cache_dir: str | Path = "data",
     gray_threshold: int = 150,
     gaussian_sigma: float = 8.0,
+    max_fill_distance: float = 24.0,
+    center_prior_sigma: float = 0.45,
     device: str | torch.device | None = None,
     seed: int | None = None,
     draw_labels: bool = True,
@@ -185,23 +193,30 @@ def test(
         cache_dir=cache_dir,
         gray_threshold=gray_threshold,
         gaussian_sigma=gaussian_sigma,
+        max_fill_distance=max_fill_distance,
+        center_prior_sigma=center_prior_sigma,
     )
     index = random.Random(seed).randrange(len(dataset))
     sample = dataset[index]
     image_tensor = sample["image"].unsqueeze(0).to(device)
     heatmap = torch.sigmoid(model(image_tensor))[0, 0].detach().cpu().numpy()
-    mask = heatmap > threshold
+    prediction_mask = heatmap > threshold
+    label_heatmap = sample["heatmap"][0].numpy()
+    label_mask = label_heatmap > (threshold if label_threshold is None else label_threshold)
 
     image_array = (sample["image"].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
     image = Image.fromarray(image_array)
     draw = ImageDraw.Draw(image)
-    for x1, y1, x2, y2 in connected_component_boxes(mask):
-        draw.rectangle((x1, y1, x2, y2), outline="lime", width=3)
+    for x1, y1, x2, y2 in connected_component_boxes(label_mask):
+        draw.rectangle((x1, y1, x2, y2), outline="yellow", width=5)
 
     if draw_labels:
         label_path = resolve_label_path(data, split, index)
         for x1, y1, x2, y2 in read_label_boxes(label_path, image.width, image.height):
             draw.rectangle((x1, y1, x2, y2), outline="red", width=3)
+
+    for x1, y1, x2, y2 in connected_component_boxes(prediction_mask):
+        draw.rectangle((x1, y1, x2, y2), outline="lime", width=2)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
@@ -330,15 +345,18 @@ def main() -> None:
             output_path=test_output,
             split=args.test_split,
             threshold=args.test_threshold,
+            label_threshold=args.test_label_threshold,
             img_size=(args.img_size[0], args.img_size[1]),
             cache_dir=args.cache_dir,
             gray_threshold=args.gray_threshold,
             gaussian_sigma=args.gaussian_sigma,
+            max_fill_distance=args.max_fill_distance,
+            center_prior_sigma=args.center_prior_sigma,
             device=device,
             seed=args.test_seed,
         )
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     test()

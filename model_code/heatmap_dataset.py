@@ -33,6 +33,8 @@ class HeatmapDataset(Dataset):
         cache_dir: str | Path = "data",
         gray_threshold: int = 150,
         gaussian_sigma: float = 8.0,
+        max_fill_distance: float = 24.0,
+        center_prior_sigma: float = 0.45,
     ) -> None:
         self.data_config = load_yolo_data_config(data_yaml)
         self.split = split
@@ -40,10 +42,18 @@ class HeatmapDataset(Dataset):
         self.cache_dir = Path(cache_dir)
         self.gray_threshold = gray_threshold
         self.gaussian_sigma = gaussian_sigma
+        self.max_fill_distance = max_fill_distance
+        self.center_prior_sigma = center_prior_sigma
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.images_path = self.cache_dir / f"heatmap_{split}_images.npy"
-        self.labels_path = self.cache_dir / f"heatmap_{split}_labels_gaussian_s{gaussian_sigma:g}.npy"
+        self.labels_path = (
+            self.cache_dir
+            / (
+                f"heatmap_{split}_labels_gaussian_s{gaussian_sigma:g}"
+                f"_d{max_fill_distance:g}_c{center_prior_sigma:g}.npy"
+            )
+        )
         if not self.images_path.exists() or not self.labels_path.exists():
             self._generate_cache()
 
@@ -89,7 +99,12 @@ class HeatmapDataset(Dataset):
                 bbox_mask = gray_mask[y1:y2, x1:x2].astype(bool)
                 heatmap[y1:y2, x1:x2] = np.maximum(
                     heatmap[y1:y2, x1:x2],
-                    gaussian_fill_from_mask(bbox_mask, sigma=self.gaussian_sigma),
+                    gaussian_fill_from_mask(
+                        bbox_mask,
+                        sigma=self.gaussian_sigma,
+                        max_distance=self.max_fill_distance,
+                        center_prior_sigma=self.center_prior_sigma,
+                    ),
                 )
 
             images[index] = image_array
@@ -162,6 +177,8 @@ def create_heatmap_dataset(
     cache_dir: str | Path = "data",
     gray_threshold: int = 150,
     gaussian_sigma: float = 8.0,
+    max_fill_distance: float = 24.0,
+    center_prior_sigma: float = 0.45,
 ) -> HeatmapDataset:
     return HeatmapDataset(
         data_yaml=data_yaml,
@@ -170,18 +187,41 @@ def create_heatmap_dataset(
         cache_dir=cache_dir,
         gray_threshold=gray_threshold,
         gaussian_sigma=gaussian_sigma,
+        max_fill_distance=max_fill_distance,
+        center_prior_sigma=center_prior_sigma,
     )
 
 
-def gaussian_fill_from_mask(mask: np.ndarray, sigma: float) -> np.ndarray:
+def gaussian_fill_from_mask(
+    mask: np.ndarray,
+    sigma: float,
+    max_distance: float,
+    center_prior_sigma: float,
+) -> np.ndarray:
     if mask.size == 0:
         return mask.astype(np.float32)
     if mask.any():
         distance = distance_to_nearest_true(mask)
         values = np.exp(-0.5 * (distance / max(sigma, 1e-6)) ** 2)
+        values[distance > max_distance] = 0.0
+        values *= bbox_center_prior(mask.shape, center_prior_sigma)
         values[mask] = 1.0
         return values.astype(np.float32)
     return np.zeros(mask.shape, dtype=np.float32)
+
+
+def bbox_center_prior(shape: tuple[int, int], sigma: float) -> np.ndarray:
+    height, width = shape
+    if height <= 0 or width <= 0:
+        return np.zeros(shape, dtype=np.float32)
+
+    y_coords, x_coords = np.indices((height, width), dtype=np.float32)
+    x_center = (width - 1) / 2.0
+    y_center = (height - 1) / 2.0
+    x_scale = max(width * sigma, 1e-6)
+    y_scale = max(height * sigma, 1e-6)
+    distance_sq = ((x_coords - x_center) / x_scale) ** 2 + ((y_coords - y_center) / y_scale) ** 2
+    return np.exp(-0.5 * distance_sq).astype(np.float32)
 
 
 def distance_to_nearest_true(mask: np.ndarray) -> np.ndarray:
