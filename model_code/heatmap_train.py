@@ -19,9 +19,15 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from heatmap_dataset import HeatmapDataset, create_heatmap_dataset, heatmap_collate_fn
+from heatmap_dataset import (
+    HeatmapDataset,
+    create_heatmap_dataset,
+    heatmap_collate_fn,
+    read_yolo_rows,
+    yolo_box_to_pixels,
+)
 from heatmap_model import build_heatmap_model
-from tracker_dataset import labels_dir_from_images_dir, load_yolo_data_config
+from tracker_dataset import labels_dir_from_images_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("runs/heatmap_train"))
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--img-size", type=int, nargs=2, default=(640, 640), metavar=("H", "W"))
-    parser.add_argument("--backbone", choices=("resnet", "darknet", "mobilenet", "efficientnet"), default="efficientnet")
+    parser.add_argument("--backbone", choices=("resnet", "darknet", "mobilenet", "efficientnet"), default="resnet")
     parser.add_argument("--width-mult", type=float, default=1.0)
     parser.add_argument("--head-channels", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
@@ -39,15 +45,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--gray-threshold", type=int, default=150)
-    parser.add_argument("--gaussian-sigma", type=float, default=8.0)
+    parser.add_argument("--gray-threshold", type=int, default=100)
+    parser.add_argument("--gaussian-sigma", type=float, default=1.0)
     parser.add_argument("--max-fill-distance", type=float, default=24.0)
-    parser.add_argument("--center-prior-sigma", type=float, default=0.45)
+    parser.add_argument("--center-prior-sigma", type=float, default=0.3)
     parser.add_argument("--pos-weight", type=float, default=5.0)
     parser.add_argument("--test-split", choices=("train", "val", "test"), default="test")
-    parser.add_argument("--test-threshold", type=float, default=0.8)
+    parser.add_argument("--test-threshold", type=float, default=0.9)
     parser.add_argument("--test-label-threshold", type=float, default=None)
     parser.add_argument("--test-output", type=Path, default=None)
+    parser.add_argument("--test-mask-output", type=Path, default=None)
     parser.add_argument("--test-seed", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -168,6 +175,7 @@ def test(
     data: str | Path = "dataset_6/data.yaml",
     checkpoint_path: str | Path = "runs/heatmap_train/best.pth",
     output_path: str | Path = "runs/heatmap_train/test_heatmap_prediction.jpg",
+    mask_output_path: str | Path | None = None,
     split: str = "test",
     threshold: float = 0.5,
     label_threshold: float | None = None,
@@ -184,6 +192,7 @@ def test(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     checkpoint_path = Path(checkpoint_path)
     output_path = Path(output_path)
+    mask_output_path = Path(mask_output_path) if mask_output_path is not None else default_mask_output_path(output_path)
 
     model = load_model_from_checkpoint(checkpoint_path, device)
     dataset = HeatmapDataset(
@@ -211,7 +220,7 @@ def test(
         draw.rectangle((x1, y1, x2, y2), outline="yellow", width=5)
 
     if draw_labels:
-        label_path = resolve_label_path(data, split, index)
+        label_path = label_path_for_dataset_sample(dataset, index)
         for x1, y1, x2, y2 in read_label_boxes(label_path, image.width, image.height):
             draw.rectangle((x1, y1, x2, y2), outline="red", width=3)
 
@@ -220,30 +229,36 @@ def test(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
+    mask_output_path.parent.mkdir(parents=True, exist_ok=True)
+    draw_heatmap_mask_visualization(image_array, heatmap, prediction_mask).save(mask_output_path)
     print(f"Saved heatmap test visualization to: {output_path}")
+    print(f"Saved heatmap mask visualization to: {mask_output_path}")
     return output_path
 
 
-def resolve_label_path(data_yaml: str | Path, split: str, index: int) -> Path:
-    data_config = load_yolo_data_config(data_yaml)
-    if split == "train":
-        image_dir = data_config.train_images
-    elif split == "val":
-        if data_config.val_images is None:
-            raise ValueError("data.yaml does not define val split.")
-        image_dir = data_config.val_images
-    else:
-        if data_config.test_images is None:
-            raise ValueError("data.yaml does not define test split.")
-        image_dir = data_config.test_images
+def default_mask_output_path(output_path: Path) -> Path:
+    suffix = output_path.suffix or ".jpg"
+    return output_path.with_name(f"{output_path.stem}_mask{suffix}")
 
-    image_paths = sorted(
-        path
-        for path in image_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    )
-    label_dir = labels_dir_from_images_dir(image_dir)
-    return label_dir / f"{image_paths[index].stem}.txt"
+
+def draw_heatmap_mask_visualization(
+    image_array: np.ndarray,
+    heatmap: np.ndarray,
+    prediction_mask: np.ndarray,
+) -> Image.Image:
+    heatmap_uint8 = (heatmap.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+    heatmap_rgb = np.stack([heatmap_uint8, heatmap_uint8, heatmap_uint8], axis=-1)
+
+    original = image_array.astype(np.float32)
+    dimmed = original * 0.35 + heatmap_rgb.astype(np.float32) * 0.65
+    dimmed[prediction_mask] = np.array([0.0, 255.0, 0.0], dtype=np.float32)
+    return Image.fromarray(dimmed.clip(0, 255).astype(np.uint8))
+
+
+def label_path_for_dataset_sample(dataset: HeatmapDataset, index: int) -> Path:
+    image_path = dataset.image_paths[index]
+    label_dir = labels_dir_from_images_dir(dataset.image_dir)
+    return label_dir / f"{image_path.stem}.txt"
 
 
 def read_label_boxes(label_path: Path, width: int, height: int) -> list[tuple[int, int, int, int]]:
@@ -251,15 +266,10 @@ def read_label_boxes(label_path: Path, width: int, height: int) -> list[tuple[in
         return []
 
     boxes: list[tuple[int, int, int, int]] = []
-    for line in label_path.read_text(encoding="utf-8").splitlines():
-        parts = line.strip().split()
-        if len(parts) != 5:
-            continue
-        x_center, y_center, box_width, box_height = (float(value) for value in parts[1:])
-        x1 = int(max(0, (x_center - box_width / 2.0) * width))
-        y1 = int(max(0, (y_center - box_height / 2.0) * height))
-        x2 = int(min(width - 1, (x_center + box_width / 2.0) * width))
-        y2 = int(min(height - 1, (y_center + box_height / 2.0) * height))
+    for _, bbox in read_yolo_rows(label_path):
+        x1, y1, x2, y2 = yolo_box_to_pixels(bbox, width, height)
+        x2 = max(x1, min(width - 1, x2 - 1))
+        y2 = max(y1, min(height - 1, y2 - 1))
         boxes.append((x1, y1, x2, y2))
     return boxes
 
@@ -339,10 +349,12 @@ def main() -> None:
         )
 
         test_output = args.test_output or args.output_dir / "test_heatmap_prediction.jpg"
+        test_mask_output = args.test_mask_output or default_mask_output_path(test_output)
         test(
             data=args.data,
             checkpoint_path=args.output_dir / "latest.pth",
             output_path=test_output,
+            mask_output_path=test_mask_output,
             split=args.test_split,
             threshold=args.test_threshold,
             label_threshold=args.test_label_threshold,
@@ -358,5 +370,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # main()
     test()

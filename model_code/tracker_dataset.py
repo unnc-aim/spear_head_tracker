@@ -23,10 +23,12 @@ All coordinates are normalized to 0..1.
 from __future__ import annotations
 
 import ast
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
@@ -100,12 +102,15 @@ class YOLOTrackerDataset(Dataset):
         image_dir: str | Path | None = None,
         label_dir: str | Path | None = None,
         num_classes: int | None = None,
+        cache_dir: str | Path = "data",
     ) -> None:
         self.root = Path(root) if root is not None else None
         self.split = split
         self.img_size = img_size
         self.max_boxes = max_boxes
         self.num_classes = num_classes
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         if image_dir is None:
             if self.root is None:
@@ -120,6 +125,11 @@ class YOLOTrackerDataset(Dataset):
         if not self.image_paths:
             raise FileNotFoundError(f"No images found in: {self.image_dir}")
 
+        self.images_path = self._cache_path()
+        if not self._cache_is_valid():
+            self._generate_image_cache()
+        self.images = np.load(self.images_path, mmap_mode="r")
+
     def __len__(self) -> int:
         return len(self.image_paths)
 
@@ -127,7 +137,7 @@ class YOLOTrackerDataset(Dataset):
         image_path = self.image_paths[index]
         label_path = self.label_dir / f"{image_path.stem}.txt"
 
-        image = self._load_image(image_path)
+        image = self._load_cached_image(index)
         boxes, valid_mask = self._load_labels(label_path)
 
         return {
@@ -145,13 +155,37 @@ class YOLOTrackerDataset(Dataset):
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
         )
 
-    def _load_image(self, image_path: Path) -> Tensor:
+    def _cache_path(self) -> Path:
+        height, width = self.img_size
+        image_dir_key = hashlib.sha1(str(self.image_dir.resolve()).encode("utf-8")).hexdigest()[:10]
+        return self.cache_dir / f"tracker_{image_dir_key}_{self.split}_images_{height}x{width}.npy"
+
+    def _cache_is_valid(self) -> bool:
+        if not self.images_path.exists():
+            return False
+        try:
+            cached = np.load(self.images_path, mmap_mode="r")
+        except (OSError, ValueError):
+            return False
+        height, width = self.img_size
+        return cached.shape == (len(self.image_paths), height, width, 3) and cached.dtype == np.uint8
+
+    def _generate_image_cache(self) -> None:
+        height, width = self.img_size
+        images = np.zeros((len(self.image_paths), height, width, 3), dtype=np.uint8)
+        for index, image_path in enumerate(self.image_paths):
+            images[index] = self._read_resized_image(image_path)
+        np.save(self.images_path, images)
+
+    def _read_resized_image(self, image_path: Path) -> np.ndarray:
         height, width = self.img_size
         image = Image.open(image_path).convert("RGB")
         image = image.resize((width, height), Image.BILINEAR)
-        data = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
-        data = data.view(height, width, 3)
-        return data.permute(2, 0, 1).float().div(255.0)
+        return np.asarray(image, dtype=np.uint8)
+
+    def _load_cached_image(self, index: int) -> Tensor:
+        image = torch.from_numpy(np.array(self.images[index], copy=True)).float().div(255.0)
+        return image.permute(2, 0, 1)
 
     def _load_labels(self, label_path: Path) -> tuple[Tensor, Tensor]:
         boxes = torch.zeros(self.max_boxes, 5, dtype=torch.float32)
@@ -217,6 +251,7 @@ def create_tracker_dataset(
     image_dir: str | Path | None = None,
     label_dir: str | Path | None = None,
     num_classes: int | None = None,
+    cache_dir: str | Path = "data",
 ) -> YOLOTrackerDataset:
     """Small factory used by training scripts."""
     return YOLOTrackerDataset(
@@ -227,6 +262,7 @@ def create_tracker_dataset(
         image_dir=image_dir,
         label_dir=label_dir,
         num_classes=num_classes,
+        cache_dir=cache_dir,
     )
 
 

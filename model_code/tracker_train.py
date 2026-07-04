@@ -38,10 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train YOLO-style bbox tracker.")
     parser.add_argument("--data", type=Path, required=True, help="Dataset root path or YOLO data.yaml path.")
     parser.add_argument("--output-dir", type=Path, default=Path("runs/tracker_train"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("data"))
     parser.add_argument("--resume", type=Path, default=None, help="Checkpoint path to resume from.")
     parser.add_argument("--num-boxes", type=int, default=100)
     parser.add_argument("--img-size", type=int, nargs=2, default=(640, 640), metavar=("H", "W"))
-    parser.add_argument("--backbone", choices=("resnet", "darknet", "mobilenet", "efficientnet"), default="efficientnet")
+    parser.add_argument("--backbone", choices=("resnet", "darknet", "mobilenet", "efficientnet"), default="resnet")
     parser.add_argument("--width-mult", type=float, default=2)
     parser.add_argument("--fpn-channels", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
@@ -88,6 +89,7 @@ def make_dataloader(
     num_workers: int,
     shuffle: bool,
     image_dir: Path | None = None,
+    cache_dir: Path = Path("data"),
 ) -> DataLoader:
     dataset = create_tracker_dataset(
         root=data_root,
@@ -95,6 +97,7 @@ def make_dataloader(
         img_size=img_size,
         max_boxes=max_boxes,
         image_dir=image_dir,
+        cache_dir=cache_dir,
     )
     return DataLoader(
         dataset,
@@ -694,6 +697,7 @@ def main() -> None:
         num_workers=args.num_workers,
         shuffle=True,
         image_dir=data_config.train_images,
+        cache_dir=args.cache_dir,
     )
 
     val_loader = None
@@ -707,6 +711,7 @@ def main() -> None:
             num_workers=args.num_workers,
             shuffle=False,
             image_dir=data_config.val_images,
+            cache_dir=args.cache_dir,
         )
 
     model = build_tracker_model(
@@ -802,5 +807,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     test()

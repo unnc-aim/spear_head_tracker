@@ -10,6 +10,7 @@ runs.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Sequence
 
@@ -31,10 +32,10 @@ class HeatmapDataset(Dataset):
         split: str,
         img_size: tuple[int, int] = (640, 640),
         cache_dir: str | Path = "data",
-        gray_threshold: int = 150,
+        gray_threshold: int = 50,
         gaussian_sigma: float = 8.0,
         max_fill_distance: float = 24.0,
-        center_prior_sigma: float = 0.45,
+        center_prior_sigma: float = 0.3,
     ) -> None:
         self.data_config = load_yolo_data_config(data_yaml)
         self.split = split
@@ -45,12 +46,18 @@ class HeatmapDataset(Dataset):
         self.max_fill_distance = max_fill_distance
         self.center_prior_sigma = center_prior_sigma
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.image_dir = self._split_image_dir()
+        self.image_paths = self._find_image_paths(self.image_dir)
 
-        self.images_path = self.cache_dir / f"heatmap_{split}_images.npy"
+        height, width = self.img_size
+        size_tag = f"{height}x{width}"
+        cache_key = cache_key_for_data_yaml(data_yaml)
+        self.images_path = self.cache_dir / f"heatmap_{cache_key}_{split}_images_{size_tag}.npy"
         self.labels_path = (
             self.cache_dir
             / (
-                f"heatmap_{split}_labels_gaussian_s{gaussian_sigma:g}"
+                f"heatmap_{cache_key}_{split}_labels_{size_tag}"
+                f"_gray{gray_threshold:g}_gaussian_s{gaussian_sigma:g}"
                 f"_d{max_fill_distance:g}_c{center_prior_sigma:g}.npy"
             )
         )
@@ -72,21 +79,15 @@ class HeatmapDataset(Dataset):
         }
 
     def _generate_cache(self) -> None:
-        image_dir = self._split_image_dir()
-        label_dir = labels_dir_from_images_dir(image_dir)
-        image_paths = sorted(
-            path
-            for path in image_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-        )
-        if not image_paths:
-            raise FileNotFoundError(f"No images found in: {image_dir}")
+        label_dir = labels_dir_from_images_dir(self.image_dir)
+        if not self.image_paths:
+            raise FileNotFoundError(f"No images found in: {self.image_dir}")
 
         height, width = self.img_size
-        images = np.zeros((len(image_paths), height, width, 3), dtype=np.uint8)
-        labels = np.zeros((len(image_paths), height, width), dtype=np.float32)
+        images = np.zeros((len(self.image_paths), height, width, 3), dtype=np.uint8)
+        labels = np.zeros((len(self.image_paths), height, width), dtype=np.float32)
 
-        for index, image_path in enumerate(image_paths):
+        for index, image_path in enumerate(self.image_paths):
             image = Image.open(image_path).convert("RGB").resize((width, height), Image.BILINEAR)
             image_array = np.asarray(image, dtype=np.uint8)
             heatmap = np.zeros((height, width), dtype=np.float32)
@@ -124,6 +125,13 @@ class HeatmapDataset(Dataset):
             raise ValueError("data.yaml does not define test split.")
         return self.data_config.test_images
 
+    def _find_image_paths(self, image_dir: Path) -> list[Path]:
+        return sorted(
+            path
+            for path in image_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
     def _gray_pixel_mask(self, image_array: np.ndarray) -> np.ndarray:
         max_channel = image_array.max(axis=-1)
         min_channel = image_array.min(axis=-1)
@@ -148,6 +156,12 @@ def read_yolo_rows(label_path: Path) -> list[tuple[int, tuple[float, float, floa
         bbox = tuple(float(value) for value in parts[1:])
         rows.append((class_id, bbox))
     return rows
+
+
+def cache_key_for_data_yaml(data_yaml: str | Path) -> str:
+    data_path = Path(data_yaml).resolve()
+    digest = hashlib.sha1(str(data_path).encode("utf-8")).hexdigest()[:10]
+    return f"{data_path.stem}_{digest}"
 
 
 def yolo_box_to_pixels(
