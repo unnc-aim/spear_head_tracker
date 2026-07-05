@@ -1,4 +1,4 @@
-"""Export HeatmapTrackerModel to heatmap_model.pt."""
+"""Export HeatmapTrackerModel to TorchScript heatmap_model.pt."""
 
 from __future__ import annotations
 
@@ -36,16 +36,11 @@ def main(path=None) -> None:
         checkpoint = torch.load(args.weights, map_location="cpu")
         model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
 
-    torch.save(
-        {
-            "model_name": model.__class__.__name__,
-            "model_state_dict": model.state_dict(),
-            "config": model.config.to_dict(),
-            "output_format": "[batch, 1, height, width] logits",
-        },
-        args.output,
-    )
-    print(f"Exported heatmap model to: {args.output}")
+    model.eval()
+    example_input = torch.zeros(1, 3, args.img_size[0], args.img_size[1])
+    traced_model = torch.jit.trace(model, example_input)
+    traced_model.save(str(args.output))
+    print(f"Exported TorchScript heatmap model to: {args.output}")
 
 
 if __name__ == "__main__":
