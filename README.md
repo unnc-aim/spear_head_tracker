@@ -1,6 +1,6 @@
 # Spear Head Tracker
 
-这个库用于做杆头追踪。当前主方案是 heatmap 分割模型：模型从输入图片中预测杆头所在区域的 heatmap，再把 heatmap 中超过阈值的连续区域转换为最小外接框，最终输出每个框的 `xywh`。
+这个库用于做杆头追踪。当前主方案是 heatmap 分割模型：模型从输入图片中预测杆头所在区域的 heatmap 和像素置信度，再把 heatmap 中超过阈值的连续区域转换为最小外接框，并用 `heatmap * confidence` 的区域平均值选择最可信的框。
 
 ## C++ 推理调用
 
@@ -39,7 +39,7 @@ std::vector<std::array<float, 4>> predictHeatmapBoxes(
     torch::Device device = torch::kCPU);
 ```
 
-用于输入模型和图片路径，输出所有分割区域的框。每个框格式为：
+用于输入模型和图片路径，输出综合平均置信度最高的分割区域框。返回类型仍是 list；如果没有有效区域则为空，如果有结果则只包含一个框。每个框格式为：
 
 ```text
 {center_x, center_y, width, height}
@@ -77,7 +77,7 @@ int main() {
 }
 ```
 
-`threshold` 控制 heatmap 二值化阈值。`min_area` 用来过滤太小的噪声连通域。
+`threshold` 控制 heatmap 二值化阈值。`min_area` 用来过滤太小的噪声连通域。多个候选连通域存在时，C++ 推理会计算每个区域内 `heatmap_prob * confidence_prob` 的平均值，并只返回平均值最高的框。
 
 ## Heatmap Model 原理
 
@@ -87,16 +87,16 @@ Heatmap 模型定义在 `model_code/heatmap_model.py`。
 
 1. 使用可选 backbone 提取图像特征。
 2. backbone 可选：`resnet`、`darknet`、`mobilenet`、`efficientnet`。
-3. heatmap head 使用卷积层把特征转换成单通道 logits。
+3. heatmap head 使用卷积层把特征转换成双通道 logits。
 4. 输出通过双线性插值恢复到输入图大小。
 
 模型输出形状：
 
 ```text
-[batch, 1, height, width]
+[batch, 2, height, width]
 ```
 
-训练时对 logits 使用 BCE loss。推理时对 logits 做 `sigmoid`，得到每个像素属于杆头区域的概率。超过阈值的像素会被视为前景，再通过连通域分析得到一个或多个最小 bbox。
+第 0 个通道是 heatmap logits，第 1 个通道是 confidence logits。训练时两个通道都用 BCE 监督，目标都是预处理生成的 heatmap label。推理时对 logits 做 `sigmoid`，heatmap 通道负责决定哪些像素是前景，confidence 通道负责给前景区域打分。最终用 `heatmap_prob * confidence_prob` 的区域平均值选择最可信 bbox。
 
 ## Label 生成逻辑
 
@@ -166,6 +166,8 @@ python model_code/heatmap_train.py --data dataset_6/data.yaml
 `--center-prior-sigma`：bbox 中心先验强度。越小越强调 bbox 中心，越能压低边缘区域。
 
 `--pos-weight`：BCE 正样本权重。正样本很少时可以调大，避免模型全部预测背景。
+
+`--conf-loss-weight`：confidence head 的 loss 权重。越大越强调像素置信度学习。
 
 `--test-split`：每个 epoch 后可视化使用的 split，默认 `test`。
 

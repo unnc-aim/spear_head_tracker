@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-fill-distance", type=float, default=24.0)
     parser.add_argument("--center-prior-sigma", type=float, default=0.3)
     parser.add_argument("--pos-weight", type=float, default=5.0)
+    parser.add_argument("--conf-loss-weight", type=float, default=1.0)
     parser.add_argument("--test-split", choices=("train", "val", "test"), default="test")
     parser.add_argument("--test-threshold", type=float, default=0.9)
     parser.add_argument("--test-label-threshold", type=float, default=None)
@@ -81,9 +82,31 @@ def make_loader(args: argparse.Namespace, split: str, shuffle: bool) -> DataLoad
     )
 
 
-def heatmap_loss(logits: Tensor, targets: Tensor, pos_weight: float) -> Tensor:
+def heatmap_loss(
+    logits: Tensor,
+    targets: Tensor,
+    pos_weight: float,
+    conf_loss_weight: float = 1.0,
+) -> tuple[Tensor, dict[str, float]]:
     positive_weight = logits.new_tensor(pos_weight)
-    return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=positive_weight)
+    heatmap_logits = logits[:, 0:1]
+    confidence_logits = logits[:, 1:2]
+    heatmap_loss_value = F.binary_cross_entropy_with_logits(
+        heatmap_logits,
+        targets,
+        pos_weight=positive_weight,
+    )
+    confidence_loss_value = F.binary_cross_entropy_with_logits(
+        confidence_logits,
+        targets,
+        pos_weight=positive_weight,
+    )
+    total_loss = heatmap_loss_value + conf_loss_weight * confidence_loss_value
+    return total_loss, {
+        "loss": float(total_loss.detach().cpu()),
+        "heatmap_loss": float(heatmap_loss_value.detach().cpu()),
+        "confidence_loss": float(confidence_loss_value.detach().cpu()),
+    }
 
 
 def run_epoch(
@@ -92,10 +115,11 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     pos_weight: float,
+    conf_loss_weight: float,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
-    total_loss = 0.0
+    totals = {"loss": 0.0, "heatmap_loss": 0.0, "confidence_loss": 0.0}
     num_batches = 0
     progress = tqdm(dataloader, desc="train" if is_train else "val", leave=False)
 
@@ -105,17 +129,18 @@ def run_epoch(
 
         with torch.set_grad_enabled(is_train):
             logits = model(images)
-            loss = heatmap_loss(logits, heatmaps, pos_weight)
+            loss, metrics = heatmap_loss(logits, heatmaps, pos_weight, conf_loss_weight)
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
 
-        total_loss += float(loss.detach().cpu())
+        for key in totals:
+            totals[key] += metrics[key]
         num_batches += 1
-        progress.set_postfix(loss=f"{total_loss / num_batches:.4f}")
+        progress.set_postfix(loss=f"{totals['loss'] / num_batches:.4f}")
 
-    return {"loss": total_loss / max(num_batches, 1)}
+    return {key: value / max(num_batches, 1) for key, value in totals.items()}
 
 
 def save_checkpoint(
@@ -133,9 +158,23 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "config": model.config.to_dict(),
             "best_val_loss": best_val_loss,
-            "output_format": "[batch, 1, height, width] logits",
+            "output_format": "[batch, 2, height, width] logits: heatmap + confidence",
         },
         output_path,
+    )
+
+
+def ensure_confidence_checkpoint(checkpoint: dict[str, object], checkpoint_path: Path) -> None:
+    output_format = str(checkpoint.get("output_format", ""))
+    state_dict = checkpoint.get("model_state_dict")
+    head_weight = state_dict.get("head.2.weight") if isinstance(state_dict, dict) else None
+    has_two_channel_head = isinstance(head_weight, Tensor) and head_weight.shape[0] == 2
+    if "heatmap + confidence" in output_format or has_two_channel_head:
+        return
+    raise ValueError(
+        f"Incompatible heatmap checkpoint: {checkpoint_path}. "
+        "The confidence-head model requires a 2-channel checkpoint. "
+        "Please retrain the heatmap model and export a new TorchScript .pt."
     )
 
 
@@ -150,6 +189,7 @@ def load_resume(
         return 0, float("inf")
     print("Load from existing checkpoint")
     checkpoint = torch.load(resume_path, map_location=device)
+    ensure_confidence_checkpoint(checkpoint, resume_path)
     model.load_state_dict(checkpoint["model_state_dict"])
     if "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -158,6 +198,7 @@ def load_resume(
 
 def load_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> nn.Module:
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    ensure_confidence_checkpoint(checkpoint, checkpoint_path)
     config = checkpoint["config"]
     model = build_heatmap_model(
         img_size=tuple(config["img_size"]),
@@ -208,7 +249,10 @@ def test(
     index = random.Random(seed).randrange(len(dataset))
     sample = dataset[index]
     image_tensor = sample["image"].unsqueeze(0).to(device)
-    heatmap = torch.sigmoid(model(image_tensor))[0, 0].detach().cpu().numpy()
+    probabilities = torch.sigmoid(model(image_tensor))[0].detach().cpu().numpy()
+    heatmap = probabilities[0]
+    confidence = probabilities[1]
+    combined_confidence = heatmap * confidence
     prediction_mask = heatmap > threshold
     label_heatmap = sample["heatmap"][0].numpy()
     label_mask = label_heatmap > (threshold if label_threshold is None else label_threshold)
@@ -224,13 +268,16 @@ def test(
         for x1, y1, x2, y2 in read_label_boxes(label_path, image.width, image.height):
             draw.rectangle((x1, y1, x2, y2), outline="red", width=3)
 
-    for x1, y1, x2, y2 in connected_component_boxes(prediction_mask):
+    best_box = best_confidence_box(prediction_mask, combined_confidence)
+    if best_box is not None:
+        x1, y1, x2, y2, score = best_box
         draw.rectangle((x1, y1, x2, y2), outline="lime", width=2)
+        draw.text((x1, max(0, y1 - 12)), f"conf {score:.3f}", fill="lime")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
     mask_output_path.parent.mkdir(parents=True, exist_ok=True)
-    draw_heatmap_mask_visualization(image_array, heatmap, prediction_mask).save(mask_output_path)
+    draw_heatmap_mask_visualization(image_array, heatmap, prediction_mask, combined_confidence).save(mask_output_path)
     print(f"Saved heatmap test visualization to: {output_path}")
     print(f"Saved heatmap mask visualization to: {mask_output_path}")
     return output_path
@@ -245,14 +292,32 @@ def draw_heatmap_mask_visualization(
     image_array: np.ndarray,
     heatmap: np.ndarray,
     prediction_mask: np.ndarray,
+    combined_confidence: np.ndarray | None = None,
 ) -> Image.Image:
-    heatmap_uint8 = (heatmap.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+    visual_map = heatmap if combined_confidence is None else combined_confidence
+    heatmap_uint8 = (visual_map.clip(0.0, 1.0) * 255.0).astype(np.uint8)
     heatmap_rgb = np.stack([heatmap_uint8, heatmap_uint8, heatmap_uint8], axis=-1)
 
     original = image_array.astype(np.float32)
     dimmed = original * 0.35 + heatmap_rgb.astype(np.float32) * 0.65
     dimmed[prediction_mask] = np.array([0.0, 255.0, 0.0], dtype=np.float32)
     return Image.fromarray(dimmed.clip(0, 255).astype(np.uint8))
+
+
+def best_confidence_box(
+    mask: np.ndarray,
+    confidence_map: np.ndarray,
+) -> tuple[int, int, int, int, float] | None:
+    best_box: tuple[int, int, int, int, float] | None = None
+    for x1, y1, x2, y2 in connected_component_boxes(mask):
+        region_mask = mask[y1 : y2 + 1, x1 : x2 + 1]
+        region_confidence = confidence_map[y1 : y2 + 1, x1 : x2 + 1]
+        if not region_mask.any():
+            continue
+        score = float(region_confidence[region_mask].mean())
+        if best_box is None or score > best_box[4]:
+            best_box = (x1, y1, x2, y2, score)
+    return best_box
 
 
 def label_path_for_dataset_sample(dataset: HeatmapDataset, index: int) -> Path:
@@ -334,8 +399,22 @@ def main() -> None:
     start_epoch, best_val_loss = load_resume(model, optimizer, resume_path, device)
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, device, optimizer, args.pos_weight)
-        val_metrics = run_epoch(model, val_loader, device, None, args.pos_weight)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer,
+            args.pos_weight,
+            args.conf_loss_weight,
+        )
+        val_metrics = run_epoch(
+            model,
+            val_loader,
+            device,
+            None,
+            args.pos_weight,
+            args.conf_loss_weight,
+        )
         val_loss = val_metrics["loss"]
 
         if val_loss < best_val_loss:
@@ -345,7 +424,12 @@ def main() -> None:
 
         print(
             f"epoch {epoch}/{args.epochs} "
-            f"train loss={train_metrics['loss']:.4f} val loss={val_metrics['loss']:.4f}"
+            f"train loss={train_metrics['loss']:.4f} "
+            f"hm={train_metrics['heatmap_loss']:.4f} "
+            f"conf={train_metrics['confidence_loss']:.4f} "
+            f"val loss={val_metrics['loss']:.4f} "
+            f"hm={val_metrics['heatmap_loss']:.4f} "
+            f"conf={val_metrics['confidence_loss']:.4f}"
         )
 
         test_output = args.test_output or args.output_dir / "test_heatmap_prediction.jpg"

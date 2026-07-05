@@ -34,13 +34,26 @@ def main(path=None) -> None:
     )
     if args.weights is not None:
         checkpoint = torch.load(args.weights, map_location="cpu")
-        model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        ensure_confidence_state_dict(state_dict, args.weights)
+        model.load_state_dict(state_dict)
 
     model.eval()
     example_input = torch.zeros(1, 3, args.img_size[0], args.img_size[1])
     traced_model = torch.jit.trace(model, example_input)
     traced_model.save(str(args.output))
     print(f"Exported TorchScript heatmap model to: {args.output}")
+
+
+def ensure_confidence_state_dict(state_dict: dict[str, torch.Tensor], checkpoint_path: Path) -> None:
+    head_weight = state_dict.get("head.2.weight")
+    if isinstance(head_weight, torch.Tensor) and head_weight.shape[0] == 2:
+        return
+    raise ValueError(
+        f"Incompatible heatmap checkpoint: {checkpoint_path}. "
+        "Expected a 2-channel confidence-head checkpoint. "
+        "Please retrain the heatmap model before exporting TorchScript."
+    )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 #include <array>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,14 +55,18 @@ std::vector<BoxXYWH> predictHeatmapBoxes(
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input);
 
-    torch::Tensor logits = model.forward(inputs).toTensor();
-    torch::Tensor mask_tensor = torch::sigmoid(logits)
-                                    .squeeze()
-                                    .detach()
-                                    .to(torch::kCPU)
-                                    .gt(threshold)
-                                    .to(torch::kU8)
-                                    .contiguous();
+    torch::Tensor probabilities = torch::sigmoid(model.forward(inputs).toTensor())
+                                      .squeeze(0)
+                                      .detach()
+                                      .to(torch::kCPU)
+                                      .contiguous();
+    if (probabilities.size(0) < 2) {
+        throw std::runtime_error("Heatmap model must output 2 channels: heatmap and confidence.");
+    }
+    torch::Tensor heatmap = probabilities[0].contiguous();
+    torch::Tensor confidence = probabilities[1].contiguous();
+    torch::Tensor combined_confidence = (heatmap * confidence).contiguous();
+    torch::Tensor mask_tensor = heatmap.gt(threshold).to(torch::kU8).contiguous();
 
     cv::Mat mask(input_height, input_width, CV_8UC1, mask_tensor.data_ptr<unsigned char>());
     cv::Mat mask_copy = mask.clone();
@@ -81,6 +86,10 @@ std::vector<BoxXYWH> predictHeatmapBoxes(
     const float scale_y = static_cast<float>(original_height) / static_cast<float>(input_height);
 
     std::vector<BoxXYWH> boxes;
+    float best_score = -std::numeric_limits<float>::infinity();
+    BoxXYWH best_box = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float* confidence_data = combined_confidence.data_ptr<float>();
+
     for (int label = 1; label < component_count; ++label) {
         const int area = stats.at<int>(label, cv::CC_STAT_AREA);
         if (area < min_area) {
@@ -97,12 +106,38 @@ std::vector<BoxXYWH> predictHeatmapBoxes(
         const float x2 = static_cast<float>(left + width) * scale_x;
         const float y2 = static_cast<float>(top + height) * scale_y;
 
-        boxes.push_back({
+        float score_sum = 0.0f;
+        int score_count = 0;
+        for (int y = top; y < top + height; ++y) {
+            const int* label_row = labels.ptr<int>(y);
+            for (int x = left; x < left + width; ++x) {
+                if (label_row[x] != label) {
+                    continue;
+                }
+                score_sum += confidence_data[y * input_width + x];
+                ++score_count;
+            }
+        }
+        if (score_count == 0) {
+            continue;
+        }
+
+        const float mean_score = score_sum / static_cast<float>(score_count);
+        if (mean_score <= best_score) {
+            continue;
+        }
+
+        best_score = mean_score;
+        best_box = {
             (x1 + x2) * 0.5f,
             (y1 + y2) * 0.5f,
             x2 - x1,
             y2 - y1,
-        });
+        };
+    }
+
+    if (best_score > -std::numeric_limits<float>::infinity()) {
+        boxes.push_back(best_box);
     }
 
     return boxes;

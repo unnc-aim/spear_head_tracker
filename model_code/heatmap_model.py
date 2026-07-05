@@ -2,7 +2,7 @@
 Heatmap model for minimum bbox extraction.
 
 The backbone choices match tracker_model.py, while the prediction head outputs
-a single-channel heatmap logit map resized to the input image size.
+heatmap and confidence logit maps resized to the input image size.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class HeatmapTrackerModel(nn.Module):
         self.head = nn.Sequential(
             ConvBNAct(self.backbone.out_channels, head_channels, kernel_size=1, padding=0),
             ConvBNAct(head_channels, head_channels),
-            nn.Conv2d(head_channels, 1, kernel_size=1),
+            nn.Conv2d(head_channels, 2, kernel_size=1),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -63,7 +63,12 @@ class HeatmapTrackerModel(nn.Module):
 
     @torch.no_grad()
     def predict_heatmap(self, x: Tensor) -> Tensor:
-        return torch.sigmoid(self.forward(x))
+        return torch.sigmoid(self.forward(x)[:, 0:1])
+
+    @torch.no_grad()
+    def predict_heatmap_and_confidence(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        probabilities = torch.sigmoid(self.forward(x))
+        return probabilities[:, 0:1], probabilities[:, 1:2]
 
 
 def build_heatmap_model(
@@ -78,4 +83,3 @@ def build_heatmap_model(
         width_mult=width_mult,
         head_channels=head_channels,
     )
-
